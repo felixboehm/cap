@@ -6,8 +6,7 @@
 #   cap call          hard-pause daemons + soft-cap heavy apps; never the live call
 #   cap off           release everything (resume, restore priority, drop caps)
 #   cap status        show what is currently paused / capped
-#   cap suggest       one-shot: list current CPU/RAM/net hogs not yet managed
-#   cap monitor [sec] watch continuously and suggest things to add (default 5s)
+#   cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
 #   cap add <pat>     remember a process/app (path substring) to cap from now on
 #   cap list          show the configured protected / daemon / app / extra lists
 #
@@ -197,8 +196,8 @@ case "${1:-help}" in
   call)     mode_call ;;
   off)      mode_off ;;
   status)   mode_status ;;
-  suggest)  suggest_once ;;
-  monitor)  while true; do clear; date "+%H:%M:%S"; suggest_once; sleep "${2:-5}"; done ;;
+  suggest)  if [ -n "${2:-}" ]; then while true; do clear 2>/dev/null; date "+%H:%M:%S"; suggest_once; sleep "$2"; done
+            else suggest_once; fi ;;
   add)      shift; [ -z "${1:-}" ] && { echo "usage: cap add <path-or-name-substring>"; exit 1; }
             echo "$*" >> "$EXTRA_LIST"; echo "added to cap list: $*  ($EXTRA_LIST)" ;;
   list)     echo "PROTECTED names:"; echo "  $PROTECTED_NAMES"; echo "PROTECTED paths:"; echo "  $PROTECTED_PATHS";
