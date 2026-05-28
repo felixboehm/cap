@@ -40,10 +40,13 @@ securityd trustd sshd sudo cap cpulimit"
 # Path substring match — also never touched (the session itself).
 PROTECTED_PATHS=".local/bin/claude Terminal.app iTerm.app"
 
-# Exact basename match — background daemons that are safe to throttle/pause.
+# Exact basename match — background daemons + sync clients safe to throttle/pause.
+# (sync engines only — their FinderSyncExt helpers are left alone so Finder
+#  doesn't stall on a frozen extension.)
 CAP_DAEMONS="mds_stores mdworker mdworker_shared mdbulkimport spotlightknowledged \
 knowledgeconstructiond corespotlightd managedcorespotlightd backupd backupd-helper \
-photoanalysisd photolibraryd mediaanalysisd cloudd bird AssetCacheLocatorService"
+photoanalysisd photolibraryd mediaanalysisd cloudd bird AssetCacheLocatorService \
+owncloud OpenCloud"
 
 # Path substring match — heavy *background* apps to soft-cap in `call` mode.
 # Interactive tools you use during a call (Teams = the call itself, Chrome,
