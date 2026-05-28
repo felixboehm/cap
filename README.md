@@ -19,24 +19,24 @@ ln -s "$PWD/cap/cap" ~/.local/bin/cap     # ~/.local/bin must be on your PATH
 
 | tool | role | install |
 |---|---|---|
-| **cpulimit** | required — CPU % capping in `on`/`call` | `brew install cpulimit` |
-| `renice`, `nettop`, `pmset`, `pgrep`, `pfctl`, `dnctl` | built in | — |
+| **cpulimit** | required — CPU % capping in `call` | `brew install cpulimit` |
+| `renice`, `nettop`, `pmset`, `pgrep`, `pfctl`, `dseditgroup` | built in | — |
 
-`cap` warns on every run if `cpulimit` is missing. Per-app network control (planned) uses the built-in `pfctl`/`dnctl` — no extra install.
+`cap` warns on every run if `cpulimit` is missing. The sync-client network block uses the built-in `pfctl` — no extra install.
 
 ## Usage
 
 ```
-cap on            soft-cap background indexers/daemons (renice + cpulimit)
-cap call          pause daemons + soft-cap heavy background apps; never the live call
-cap off           release everything (resume, restore priority, drop caps)
-cap status        show what is currently paused / capped / busy
+cap call          quiet things for a call: pause daemons, cpu-cap heavy
+                  apps, block sync clients' network; never the live call
+cap off           release everything (resume, unblock, drop caps)
+cap status        show what is paused / capped / blocked
 cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
 cap add <pat>     remember a process/app (path substring) to cap from now on
-cap list          show what each mode caps vs. protects
+cap list          show what call mode caps vs. protects
 ```
 
-Capping your own apps needs no privileges. Capping **system daemons** (`mds_stores`, `backupd`, …) needs root, so for the full effect:
+Capping your own apps needs no privileges. Pausing **system daemons** and blocking sync clients need root:
 
 ```sh
 sudo cap call     # entering a call
@@ -46,29 +46,39 @@ sudo cap off      # done
 ## How it works
 
 - **Call detection** — `cap` reads `pmset -g assertions` for the `coreaudiod` input (mic) assertion. The owning process is the active call, and its entire `.app` bundle (audio, video, and screen-share renderers) is exempt — not just the mic-holding PID.
-- **Throttling** — three escalating mechanisms:
-  - `renice` — deprioritize (safe, reversible, never freezes).
-  - `cpulimit` — cap to a CPU % (duty-cycled SIGSTOP/SIGCONT).
-  - `SIGSTOP`/`SIGCONT` — hard pause/resume (used for background daemons in `call`).
-- **`on` vs `call`** — `on` soft-caps the background daemons and leaves apps alone; `call` hard-pauses the daemons and soft-caps heavy background apps, while protecting the live call.
+- **What `call` does** — three treatments:
+  - **Daemons** (Spotlight, backups, iCloud, photo analysis): hard-paused with `SIGSTOP`, resumed with `SIGCONT` on `off`.
+  - **Heavy background apps** (`Spotify`, `Docker`, …): `renice` + `cpulimit` to a CPU %.
+  - **Sync clients** (`owncloud`, `OpenCloud`): outbound network **blocked** (see below). The call app itself is always exempt.
+
+## Sync-client network block
+
+macOS has no by-name per-process network filter for scripts, so `cap` uses the built-in `pf`, matched on a **group**:
+
+1. `cap` creates a `capnet` group (one-time) and, in `call`, relaunches each running sync client under it via `sudo -g capnet open -a …` — **only if it's already running** (cap never starts apps).
+2. A `pf` anchor (`block drop out group capnet`) is loaded; `cap off` flushes it.
+
+Caveat: the relaunch is required because traffic is matched by group, and you can't tag an already-running process — so a sync client must be (re)started under the group for the block to apply.
 
 ## What gets capped vs. protected
 
 `cap list` prints the current lists. Defaults:
 
-- **Protected (never touched, any mode):** `kernel_task`, `launchd`, `WindowServer`, `coreaudiod`, `loginwindow`, the session itself, and the live call app's whole bundle.
-- **Daemons (paused in `call`, throttled in `on`):** Spotlight (`mds_stores`, `mdworker`, `*spotlight*`), backups (`backupd`), iCloud (`cloudd`, `bird`), photo analysis, and the `owncloud`/`OpenCloud` sync engines.
-- **Background apps (soft-capped in `call`):** `Spotify`, `Docker`, `qemu`, `java`. Interactive tools you use during calls (Teams, Chrome, VS Code) are deliberately excluded.
+- **Protected (never touched):** `kernel_task`, `launchd`, `WindowServer`, `coreaudiod`, `loginwindow`, the session itself, and the live call app's whole bundle.
+- **Daemons (paused):** Spotlight (`mds_stores`, `mdworker`, `*spotlight*`), backups (`backupd`), iCloud (`cloudd`, `bird`), photo analysis.
+- **Heavy apps (cpu-capped):** `Spotify`, `Docker`, `qemu`, `java`. Interactive tools you use during calls (Teams, Chrome, VS Code) are deliberately excluded.
+- **Sync clients (network-blocked):** `owncloud`, `OpenCloud`.
 
 ## Configuration
 
 Overrides live in `~/.cap/`:
 
-- `~/.cap/config.sh` — shell file sourced at startup; override any tunable (`CPU_THRESHOLD`, `SOFT_LIMIT`, `APP_LIMIT`, `RENICE_VAL`, the `PROTECTED_*` / `CAP_*` lists, …).
+- `~/.cap/config.sh` — shell file sourced at startup; override any tunable (`CPU_THRESHOLD`, `APP_LIMIT`, `RENICE_VAL`, `THROTTLE_GROUP`, `SYNC_APPS`, the `PROTECTED_*` / `CAP_*` lists, …).
 - `~/.cap/extra.list` — extra path/name substrings to cap, one per line (managed via `cap add`).
 
 ## Limitations
 
-- **Per-app network control is not wired up yet.** macOS has no by-name per-process network API for scripts; the workable route is built-in `pfctl`/`dnctl` (block + bandwidth shaping) matched on a throttle group, which requires launching the target app under that group (a one-time relaunch). This is planned, not yet implemented.
-- Capping system daemons requires `sudo`.
+- **`call`/`off` need `sudo`** (pausing root daemons, editing the `pf` anchor, `sudo -g` relaunch). See sudoers tips to run without a password prompt.
+- The sync-client block only applies to clients **(re)started under the `capnet` group** — launch them via `cap`, or relaunch with `cap call`.
+- First `sudo cap call` appends a `cap` anchor to `/etc/pf.conf` and enables `pf`.
 - An automatic "arm on call start / disarm on call end" daemon is not yet built; modes are run manually.
