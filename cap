@@ -45,8 +45,10 @@ CAP_DAEMONS="mds_stores mdworker mdworker_shared mdbulkimport spotlightknowledge
 knowledgeconstructiond corespotlightd managedcorespotlightd backupd backupd-helper \
 photoanalysisd photolibraryd mediaanalysisd cloudd bird AssetCacheLocatorService"
 
-# Path substring match — heavy apps to soft-cap on a call / when idle.
-CAP_APPS="Microsoft Teams|Google Chrome|Visual Studio Code|Code Helper|Slack|Spotify|Docker|qemu|java"
+# Path substring match — heavy *background* apps to soft-cap in `call` mode.
+# Interactive tools you use during a call (Teams = the call itself, Chrome,
+# VS Code) are intentionally excluded so the call/your work isn't throttled.
+CAP_APPS="Spotify|Docker|qemu|java"
 
 [ -f "$USER_CONF" ] && . "$USER_CONF"
 
