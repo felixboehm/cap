@@ -137,14 +137,17 @@ under_group(){ local gid pid; gid="$(group_gid)"; [ -n "$gid" ] || return 1
   for pid in $(pgrep -x "$1" 2>/dev/null); do [ "$(ps -o gid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$gid" ] && return 0; done
   return 1; }
 # relaunch app $1 under the throttle group — ONLY if it is already running.
-regroup_app(){ local app="$1" n=0
+# Launches as the invoking user (not root) so a `sudo cap` run doesn't start
+# the app as root.
+regroup_app(){ local app="$1" n=0 asuser=()
+  [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && asuser=(-u "$SUDO_USER")
   pgrep -x "$app" >/dev/null 2>&1 || { echo "  $app not running — skipped"; return 0; }
   under_group "$app" && { echo "  $app already under '$THROTTLE_GROUP'"; return 0; }
   echo "  restarting $app under '$THROTTLE_GROUP'..."
   osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1
   while pgrep -x "$app" >/dev/null 2>&1 && [ "$n" -lt 12 ]; do sleep 0.5; n=$((n+1)); done
   pgrep -x "$app" >/dev/null 2>&1 && pkill -x "$app" 2>/dev/null
-  sudo -g "$THROTTLE_GROUP" open -a "$app" && echo "    relaunched $app"
+  sudo "${asuser[@]}" -g "$THROTTLE_GROUP" open -a "$app" && echo "    relaunched $app"
 }
 pf_block_on(){
   ensure_group
