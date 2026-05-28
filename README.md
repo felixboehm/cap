@@ -13,7 +13,6 @@ macOS has **App Nap** (passive, only naps occluded GUI apps) and the GUI-only co
 ```sh
 git clone https://github.com/felixboehm/cap.git
 ln -s "$PWD/cap/cap" ~/.local/bin/cap     # ~/.local/bin must be on your PATH
-cap deps                                   # check dependencies
 ```
 
 ## Dependencies
@@ -21,10 +20,9 @@ cap deps                                   # check dependencies
 | tool | role | install |
 |---|---|---|
 | **cpulimit** | required — CPU % capping in `on`/`call` | `brew install cpulimit` |
-| per-app network tool (e.g. **LuLu**) | optional — bandwidth / offline control | `brew install --cask lulu` |
-| `renice`, `nettop`, `pmset`, `pgrep`, `sandbox-exec` | built in | — |
+| `renice`, `nettop`, `pmset`, `pgrep`, `pfctl`, `dnctl` | built in | — |
 
-Run `cap deps` to see what's present and what to install.
+`cap` warns on every run if `cpulimit` is missing. Per-app network control (planned) uses the built-in `pfctl`/`dnctl` — no extra install.
 
 ## Usage
 
@@ -36,7 +34,6 @@ cap status        show what is currently paused / capped / busy
 cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
 cap add <pat>     remember a process/app (path substring) to cap from now on
 cap list          show what each mode caps vs. protects
-cap deps          check dependencies
 ```
 
 Capping your own apps needs no privileges. Capping **system daemons** (`mds_stores`, `backupd`, …) needs root, so for the full effect:
@@ -72,6 +69,6 @@ Overrides live in `~/.cap/`:
 
 ## Limitations
 
-- **No per-app network control from a script (yet).** macOS only exposes per-app network filtering through the `NetworkExtension` framework, i.e. a packaged firewall app. LuLu provides the block but has no CLI; bandwidth/offline integration is being evaluated.
+- **Per-app network control is not wired up yet.** macOS has no by-name per-process network API for scripts; the workable route is built-in `pfctl`/`dnctl` (block + bandwidth shaping) matched on a throttle group, which requires launching the target app under that group (a one-time relaunch). This is planned, not yet implemented.
 - Capping system daemons requires `sudo`.
 - An automatic "arm on call start / disarm on call end" daemon is not yet built; modes are run manually.
