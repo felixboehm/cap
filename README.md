@@ -34,14 +34,19 @@ cap status        show what is paused / capped / blocked
 cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
 cap add <pat>     remember a process/app (path substring) to cap from now on
 cap list          show what call mode caps vs. protects
+cap setup         one-time: create the throttle group + pf anchor (needs sudo)
 ```
 
-Capping your own apps needs no privileges. Pausing **system daemons** and blocking sync clients need root:
+### Running without a password
 
-```sh
-sudo cap call     # entering a call
-sudo cap off      # done
-```
+`call`/`off` need root (pausing daemons, the `pf` block, the group relaunch). To avoid `sudo` prompts:
+
+1. Run the one-time setup (does the file-writing bits that must *not* be passwordless):
+   ```sh
+   sudo cap setup
+   ```
+2. It prints a `sudoers` drop-in — install it (validate with `visudo -c`). It NOPASSWDs only process/firewall commands (`pfctl`, `kill`, `renice`, `pkill`, `cpulimit`, `open`), **not** `tee`/file writes — so it can't be turned into a passwordless root shell.
+3. Then just run `cap call` / `cap off` — no `sudo`, no password.
 
 ## How it works
 
@@ -78,7 +83,7 @@ Overrides live in `~/.cap/`:
 
 ## Limitations
 
-- **`call`/`off` need `sudo`** (pausing root daemons, editing the `pf` anchor, `sudo -g` relaunch). See sudoers tips to run without a password prompt.
-- The sync-client block only applies to clients **(re)started under the `capnet` group** — launch them via `cap`, or relaunch with `cap call`.
-- First `sudo cap call` appends a `cap` anchor to `/etc/pf.conf` and enables `pf`.
+- **`call`/`off` need root** (pausing daemons, the `pf` block, the group relaunch). Run `cap setup` once + install the printed sudoers drop-in to use them without a password.
+- The sync-client block only applies to clients **(re)started under the `capnet` group** — `cap call` relaunches running ones automatically.
+- `cap setup` appends a `cap` anchor to `/etc/pf.conf` and (on `call`) enables `pf`.
 - An automatic "arm on call start / disarm on call end" daemon is not yet built; modes are run manually.

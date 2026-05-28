@@ -9,9 +9,10 @@
 #   cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
 #   cap add <pat>     remember a process/app (substring) to cap from now on
 #   cap list          show what call mode caps vs. protects
+#   cap setup         one-time: create the throttle group + pf anchor (sudo)
 #
-# No sudo needed to cap your own apps. Pausing system daemons + blocking
-# sync clients needs root:  sudo cap call  /  sudo cap off
+# Run `cap setup` once, then add the sudoers drop-in it prints to run
+# `cap call` / `cap off` with no password (no `sudo cap` needed).
 #
 set -uo pipefail
 shopt -s nocasematch 2>/dev/null   # case-insensitive [[ ]] / case — avoids forking `tr` per compare
@@ -126,7 +127,6 @@ limit_pid(){ # pid limit%
 }
 drop_all_limits(){ pkill -x cpulimit 2>/dev/null; sudo pkill -x cpulimit 2>/dev/null; : > "$CPULIMIT_PIDS"; }
 
-warm_sudo_if_needed(){ echo "caching sudo (needed for daemons + network block)..."; sudo -v || true; }
 label(){ local pid="$1" b; b="$(base_of "$pid")"; case "$b" in "")echo "$pid";; *)echo "$b ($pid)";; esac; }
 
 # ---------- actions: network block (pf, by group) ----------
@@ -139,30 +139,54 @@ under_group(){ local gid pid; gid="$(group_gid)"; [ -n "$gid" ] || return 1
 # relaunch app $1 under the throttle group — ONLY if it is already running.
 # Launches as the invoking user (not root) so a `sudo cap` run doesn't start
 # the app as root.
-regroup_app(){ local app="$1" n=0 asuser=()
-  [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && asuser=(-u "$SUDO_USER")
+regroup_app(){ local app="$1" n=0 ruser="${SUDO_USER:-$(id -un)}"
   pgrep -x "$app" >/dev/null 2>&1 || { echo "  $app not running — skipped"; return 0; }
   under_group "$app" && { echo "  $app already under '$THROTTLE_GROUP'"; return 0; }
   echo "  restarting $app under '$THROTTLE_GROUP'..."
   osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1
   while pgrep -x "$app" >/dev/null 2>&1 && [ "$n" -lt 12 ]; do sleep 0.5; n=$((n+1)); done
   pgrep -x "$app" >/dev/null 2>&1 && pkill -x "$app" 2>/dev/null
-  sudo "${asuser[@]}" -g "$THROTTLE_GROUP" open -a "$app" && echo "    relaunched $app"
+  sudo -u "$ruser" -g "$THROTTLE_GROUP" open -a "$app" && echo "    relaunched $app (as $ruser)"
 }
+# Runtime block: load rules into the pre-wired anchor via stdin (no file writes,
+# so it can be NOPASSWD'd safely). `cap setup` must have run once.
 pf_block_on(){
-  ensure_group
-  printf 'block drop out group %s\n' "$THROTTLE_GROUP" | sudo tee "$PF_ANCHOR_FILE" >/dev/null
-  grep -q "anchor \"$PF_ANCHOR\"" /etc/pf.conf 2>/dev/null || \
-    printf 'anchor "%s"\nload anchor "%s" from "%s"\n' "$PF_ANCHOR" "$PF_ANCHOR" "$PF_ANCHOR_FILE" | sudo tee -a /etc/pf.conf >/dev/null
-  sudo pfctl -f /etc/pf.conf >/dev/null 2>&1
+  [ -n "$(group_gid)" ] || { echo "  network: group missing — run 'sudo cap setup' once"; return 1; }
+  grep -q "anchor \"$PF_ANCHOR\"" /etc/pf.conf 2>/dev/null || { echo "  network: pf anchor not installed — run 'sudo cap setup' once"; return 1; }
+  printf 'block drop out group %s\n' "$THROTTLE_GROUP" | sudo pfctl -a "$PF_ANCHOR" -f - >/dev/null 2>&1
   sudo pfctl -e >/dev/null 2>&1 || true   # ignore "already enabled"
   echo "  network: blocking group '$THROTTLE_GROUP' outbound"
 }
 pf_block_off(){ sudo pfctl -a "$PF_ANCHOR" -F rules >/dev/null 2>&1 && echo "  network: unblocked"; }
 
+# One-time privileged setup: the parts that write files / create groups (which
+# must NOT be NOPASSWD'd). Run once with `sudo cap setup`.
+mode_setup(){
+  local u g
+  echo "cap one-time setup (needs your sudo password)..."
+  ensure_group; g="$(group_gid)"; echo "  group '$THROTTLE_GROUP' ready (gid ${g:-?})"
+  if grep -q "anchor \"$PF_ANCHOR\"" /etc/pf.conf 2>/dev/null; then echo "  pf anchor already in /etc/pf.conf"
+  else printf 'anchor "%s"\n' "$PF_ANCHOR" | sudo tee -a /etc/pf.conf >/dev/null && echo "  added 'anchor \"$PF_ANCHOR\"' to /etc/pf.conf"; fi
+  sudo pfctl -f /etc/pf.conf >/dev/null 2>&1 && echo "  pf reloaded"
+  u="$(id -un)"
+  cat <<EOF
+
+To run \`cap call\` / \`cap off\` WITHOUT a password (no \`sudo cap\`), install:
+
+  sudo tee /etc/sudoers.d/cap >/dev/null <<'SUDOERS'
+$u ALL=(root) NOPASSWD: /sbin/pfctl, /bin/kill, /usr/bin/renice, /usr/bin/pkill, /usr/local/bin/cpulimit
+$u ALL=($u:$THROTTLE_GROUP) NOPASSWD: /usr/bin/open
+SUDOERS
+  sudo chmod 440 /etc/sudoers.d/cap && sudo visudo -cf /etc/sudoers.d/cap
+
+These NOPASSWD only process/firewall control — no file writes — so they
+can't be turned into a root shell the way \`sudo tee\` could.
+EOF
+}
+
 # ---------- modes ----------
 mode_call(){
-  detect_call; warm_sudo_if_needed
+  detect_call
   [ -n "$CALL_PIDS" ] && echo "active call: PID(s) $CALL_PIDS (whitelisted)" || echo "no active call (no live mic) — capping anyway"
   local pid app n=0 m=0
   for pid in $(daemon_pids); do
@@ -240,6 +264,7 @@ dep_warn
 case "${1:-help}" in
   call)     mode_call ;;
   off)      mode_off ;;
+  setup)    mode_setup ;;
   status)   mode_status ;;
   suggest)  if [ -n "${2:-}" ]; then while true; do clear 2>/dev/null; date "+%H:%M:%S"; suggest_once; sleep "$2"; done
             else suggest_once; fi ;;
@@ -255,6 +280,6 @@ case "${1:-help}" in
             echo "  heavy apps (cpu-capped): ${CAP_APPS//|/, }"
             echo "  extra (cpu-capped):      $(tr '\n' ' ' < "$EXTRA_LIST")"
             echo "  sync clients (blocked):  $SYNC_APPS   (relaunched under group '$THROTTLE_GROUP' if running)" ;;
-  help|-h|--help) sed -n '3,14p' "$0" | sed 's/^#//;s/^ //' ;;
+  help|-h|--help) sed -n '3,15p' "$0" | sed 's/^#//;s/^ //' ;;
   *)        echo "unknown mode: $1"; echo "try: cap help"; exit 1 ;;
 esac
