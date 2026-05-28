@@ -74,9 +74,19 @@ extra_hits(){ # path  -> matches any line in extra.list
 
 # PIDs holding a live mic (input) audio assertion = the active call app(s).
 call_pids(){ pmset -g assertions 2>/dev/null | awk '/coreaudiod/{c=1} c&&/input.*preventuseridlesleep|input.*context/{f=1} /Created for PID:/{if(f){gsub(/[^0-9]/,"",$NF);print $NF;f=0}}' | sort -u; }
+# .app bundles of the call PIDs — so the whole call app (video/screen-share
+# renderers too), not just the mic-holding PID, is exempt during a call.
+call_bundles(){ local pid p; for pid in $CALL_PIDS; do p="$(path_of "$pid")"; case "$p" in *.app/*) echo "${p%%.app/*}.app";; esac; done | sort -u; }
+detect_call(){ CALL_PIDS="$(call_pids)"; CALL_BUNDLES="$(call_bundles)"; }
+in_call_bundle(){ local p="$1" b
+  while IFS= read -r b; do [ -z "$b" ] && continue; case "$p" in "$b"/*) return 0;; esac; done <<EOF
+${CALL_BUNDLES:-}
+EOF
+  return 1
+}
 
 is_protected(){ # pid
-  local pid="$1" base path uid
+  local pid="$1" base path
   [ "$pid" -le 1 ] 2>/dev/null && return 0
   [ "$pid" = "$$" ] || [ "$pid" = "$PPID" ] && return 0
   base="$(base_of "$pid")"; path="$(path_of "$pid")"
@@ -84,6 +94,7 @@ is_protected(){ # pid
   in_words "$base" "$PROTECTED_NAMES" && return 0
   path_hits "$path" "$(echo "$PROTECTED_PATHS" | tr ' ' '|')" && return 0
   local p; for p in $CALL_PIDS; do [ "$p" = "$pid" ] && return 0; done
+  in_call_bundle "$path" && return 0               # any process of the live call app
   return 1
 }
 
@@ -115,7 +126,7 @@ label(){ local pid="$1" b; b="$(base_of "$pid")"; case "$b" in "")echo "$pid";; 
 
 # ---------- modes ----------
 mode_on(){
-  CALL_PIDS="$(call_pids)"; warm_sudo_if_needed
+  detect_call; warm_sudo_if_needed
   local pid n=0
   for pid in $(daemon_pids); do
     is_protected "$pid" && continue
@@ -126,7 +137,7 @@ mode_on(){
 }
 
 mode_call(){
-  CALL_PIDS="$(call_pids)"; warm_sudo_if_needed
+  detect_call; warm_sudo_if_needed
   [ -n "$CALL_PIDS" ] && echo "active call detected: PID(s) $CALL_PIDS (whitelisted)" || echo "no active call detected (no live mic) — capping anyway"
   local pid n=0 m=0
   for pid in $(daemon_pids); do
@@ -142,7 +153,7 @@ mode_call(){
 }
 
 mode_off(){
-  CALL_PIDS=""
+  CALL_PIDS=""; CALL_BUNDLES=""
   local pid n=0
   drop_all_limits
   for pid in $(daemon_pids) $(app_pids); do
@@ -153,7 +164,7 @@ mode_off(){
 }
 
 mode_status(){
-  CALL_PIDS="$(call_pids)"
+  detect_call
   echo "== paused / capped / busy managed processes =="
   local pid st nice cpu cmd base tag shown=0 total=0
   # one ps snapshot fed via here-doc (keeps the loop in this shell so counters persist)
@@ -179,11 +190,11 @@ EOF
 }
 
 suggest_once(){
-  CALL_PIDS="$(call_pids)"
+  detect_call
   echo "== hogs over thresholds (cpu>=${CPU_THRESHOLD}% or mem>=${MEM_THRESHOLD}%) =="
   ps -axo pid=,pcpu=,pmem=,comm= -r | while read -r pid cpu mem cmd; do
     { [ "${cpu%%.*}" -ge "$CPU_THRESHOLD" ] || [ "${mem%%.*}" -ge "$MEM_THRESHOLD" ]; } 2>/dev/null || continue
-    is_protected "$pid" && { printf "  protected  %-34s cpu=%s%% mem=%s%%\n" "${cmd##*/}" "$cpu" "$mem"; continue; }
+    is_protected "$pid" && continue          # protected procs are never actionable — hide them
     if in_words "${cmd##*/}" "$CAP_DAEMONS" || path_hits "$cmd" "$CAP_APPS" || extra_hits "$cmd"; then
       printf "  managed    %-34s cpu=%s%% mem=%s%%\n" "${cmd##*/}" "$cpu" "$mem"
     else
