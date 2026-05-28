@@ -9,6 +9,7 @@
 #   cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
 #   cap add <pat>     remember a process/app (path substring) to cap from now on
 #   cap list          show what each mode caps vs. protects
+#   cap deps          check required/optional dependencies (cpulimit, net tool)
 #
 # Capping your own apps needs no sudo. Capping system daemons (mds_stores, etc.)
 # needs root, so for the full effect run:  sudo cap call  /  sudo cap on
@@ -56,6 +57,13 @@ CAP_APPS="Spotify|Docker|qemu|java"
 [ -f "$USER_CONF" ] && . "$USER_CONF"
 
 # ---------- helpers ----------
+have(){ command -v "$1" >/dev/null 2>&1; }
+# Detect an installed per-app network tool (for bandwidth/offline control).
+detect_net_tool(){
+  if   [ -d "/Applications/LuLu.app" ]; then NET_TOOL="LuLu"
+  elif [ -d "/Applications/Little Snitch.app" ] || have littlesnitch; then NET_TOOL="Little Snitch"
+  else NET_TOOL=""; fi
+}
 path_of(){ ps -o comm= -p "$1" 2>/dev/null; }
 base_of(){ local p; p="$(path_of "$1")"; [ -n "$p" ] && printf '%s' "${p##*/}"; }
 owner_uid(){ ps -o uid= -p "$1" 2>/dev/null | tr -d ' '; }
@@ -127,9 +135,23 @@ warm_sudo_if_needed(){ # pre-prompt once if any listed pid is root-owned
 
 label(){ local pid="$1" b; b="$(base_of "$pid")"; case "$b" in "")echo "$pid";; *)echo "$b ($pid)";; esac; }
 
+mode_deps(){
+  echo "cap dependencies:"
+  if have cpulimit; then echo "  [ok]       cpulimit       — CPU % capping in 'on' / 'call'"
+  else echo "  [MISSING]  cpulimit       — REQUIRED for soft-caps;  brew install cpulimit"; fi
+  detect_net_tool
+  if [ -n "${NET_TOOL:-}" ]; then echo "  [ok]       $NET_TOOL          — per-app network (bandwidth / offline)"
+  else
+    echo "  [absent]   network tool   — needed for bandwidth/offline control. Install one:"
+    echo "                                brew install --cask lulu   (free; no CLI yet)"
+  fi
+  printf "  built-ins: "; for t in renice nettop pmset pgrep sandbox-exec; do have "$t" && printf "%s " "$t"; done; echo
+}
+
 # ---------- modes ----------
 mode_on(){
   detect_call; warm_sudo_if_needed
+  have cpulimit || echo "  ! cpulimit missing — CPU caps skipped (renice still applies). brew install cpulimit"
   local pid n=0
   for pid in $(daemon_pids); do
     is_protected "$pid" && continue
@@ -141,6 +163,8 @@ mode_on(){
 
 mode_call(){
   detect_call; warm_sudo_if_needed
+  have cpulimit || echo "  ! cpulimit missing — CPU caps skipped (renice/pause still apply). brew install cpulimit"
+  detect_net_tool; [ -z "${NET_TOOL:-}" ] && echo "  (no per-app network tool — bandwidth/offline unavailable; run 'cap deps')"
   [ -n "$CALL_PIDS" ] && echo "active call detected: PID(s) $CALL_PIDS (whitelisted)" || echo "no active call detected (no live mic) — capping anyway"
   local pid n=0 m=0
   for pid in $(daemon_pids); do
@@ -218,6 +242,7 @@ case "${1:-help}" in
             else suggest_once; fi ;;
   add)      shift; [ -z "${1:-}" ] && { echo "usage: cap add <path-or-name-substring>"; exit 1; }
             echo "$*" >> "$EXTRA_LIST"; echo "added to cap list: $*  ($EXTRA_LIST)" ;;
+  deps)     mode_deps ;;
   list)     echo "PROTECTED — never touched in any mode:"
             echo "  names: $PROTECTED_NAMES"
             echo "  paths: $PROTECTED_PATHS"
@@ -230,6 +255,6 @@ case "${1:-help}" in
             echo "  daemons (paused): $CAP_DAEMONS"
             echo "  apps (capped):    ${CAP_APPS//|/, }"
             echo "  extra (capped):   $(tr '\n' ' ' < "$EXTRA_LIST")" ;;
-  help|-h|--help) sed -n '3,14p' "$0" | sed 's/^#//;s/^ //' ;;
+  help|-h|--help) sed -n '3,15p' "$0" | sed 's/^#//;s/^ //' ;;
   *)        echo "unknown mode: $1"; echo "try: cap help"; exit 1 ;;
 esac
