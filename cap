@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# cap — call-aware process throttler for macOS
+#
+#   cap on            soft-cap background indexers/daemons (renice + cpulimit)
+#   cap call          hard-pause daemons + soft-cap heavy apps; never the live call
+#   cap off           release everything (resume, restore priority, drop caps)
+#   cap status        show what is currently paused / capped
+#   cap suggest       one-shot: list current CPU/RAM/net hogs not yet managed
+#   cap monitor [sec] watch continuously and suggest things to add (default 5s)
+#   cap add <pat>     remember a process/app (path substring) to cap from now on
+#   cap list          show the configured protected / daemon / app / extra lists
+#
+# Capping your own apps needs no sudo. Capping system daemons (mds_stores, etc.)
+# needs root, so for the full effect run:  sudo cap call  /  sudo cap on
+#
+set -uo pipefail
+
+CAP_HOME="${CAP_HOME:-$HOME/.cap}"
+STATE_DIR="$CAP_HOME/state"
+EXTRA_LIST="$CAP_HOME/extra.list"
+USER_CONF="$CAP_HOME/config.sh"
+CPULIMIT_PIDS="$STATE_DIR/cpulimit.pids"
+mkdir -p "$STATE_DIR"
+[ -f "$EXTRA_LIST" ] || : > "$EXTRA_LIST"
+
+# ---------- tunables (override in ~/.cap/config.sh) ----------
+CPU_THRESHOLD=20      # %CPU to flag in suggest/monitor
+MEM_THRESHOLD=5       # %MEM to flag in suggest/monitor
+NET_THRESHOLD_KB=300  # KB over the sample window to flag a network talker
+SOFT_LIMIT=15         # cpulimit % per core for `on`
+APP_LIMIT=25          # cpulimit % per core for apps in `call`
+RENICE_VAL=18         # nice value applied when soft-capping
+
+# Exact basename match — never touched.
+PROTECTED_NAMES="kernel_task launchd WindowServer coreaudiod loginwindow logind \
+opendirectoryd bluetoothd powerd watchdogd locationd mds cfprefsd UserEventAgent \
+securityd trustd sshd sudo cap cpulimit"
+
+# Path substring match — also never touched (the session itself).
+PROTECTED_PATHS=".local/bin/claude Terminal.app iTerm.app"
+
+# Exact basename match — background daemons that are safe to throttle/pause.
+CAP_DAEMONS="mds_stores mdworker mdworker_shared mdbulkimport spotlightknowledged \
+knowledgeconstructiond corespotlightd managedcorespotlightd backupd backupd-helper \
+photoanalysisd photolibraryd mediaanalysisd cloudd bird AssetCacheLocatorService"
+
+# Path substring match — heavy apps to soft-cap on a call / when idle.
+CAP_APPS="Microsoft Teams|Google Chrome|Visual Studio Code|Code Helper|Slack|Spotify|Docker|qemu|java"
+
+[ -f "$USER_CONF" ] && . "$USER_CONF"
+
+# ---------- helpers ----------
+lc(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+path_of(){ ps -o comm= -p "$1" 2>/dev/null; }
+base_of(){ local p; p="$(path_of "$1")"; [ -n "$p" ] && printf '%s' "${p##*/}"; }
+owner_uid(){ ps -o uid= -p "$1" 2>/dev/null | tr -d ' '; }
+state_of(){ ps -o state= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# Run a command, escalating to sudo when the target pid ($1) is owned by another user.
+priv(){ local pid="$1"; shift; if [ "$(owner_uid "$pid")" != "$(id -u)" ]; then sudo "$@"; else "$@"; fi; }
+
+in_words(){ local v="$1" w; for w in $2; do [ "$w" = "$v" ] && return 0; done; return 1; }
+path_hits(){ # path, pipe-or-space separated patterns
+  local p; p="$(lc "$1")"; shift
+  local IFS='|' pat; for pat in $1; do pat="$(lc "$pat")"; [ -n "$pat" ] && case "$p" in *"$pat"*) return 0;; esac; done
+  return 1
+}
+extra_hits(){ # path  -> matches any line in extra.list
+  local p line; p="$(lc "$1")"
+  while IFS= read -r line; do [ -z "$line" ] && continue; line="$(lc "$line")"; case "$p" in *"$line"*) return 0;; esac; done < "$EXTRA_LIST"
+  return 1
+}
+
+# PIDs holding a live mic (input) audio assertion = the active call app(s).
+call_pids(){ pmset -g assertions 2>/dev/null | awk '/coreaudiod/{c=1} c&&/input.*preventuseridlesleep|input.*context/{f=1} /Created for PID:/{if(f){gsub(/[^0-9]/,"",$NF);print $NF;f=0}}' | sort -u; }
+
+is_protected(){ # pid
+  local pid="$1" base path uid
+  [ "$pid" -le 1 ] 2>/dev/null && return 0
+  [ "$pid" = "$$" ] || [ "$pid" = "$PPID" ] && return 0
+  base="$(base_of "$pid")"; path="$(path_of "$pid")"
+  [ -z "$base" ] && return 0                       # vanished -> skip
+  in_words "$base" "$PROTECTED_NAMES" && return 0
+  path_hits "$path" "$(echo "$PROTECTED_PATHS" | tr ' ' '|')" && return 0
+  local p; for p in $CALL_PIDS; do [ "$p" = "$pid" ] && return 0; done
+  return 1
+}
+
+# all pids whose basename is a known daemon
+daemon_pids(){ ps -axo pid=,comm= | while read -r pid cmd; do in_words "${cmd##*/}" "$CAP_DAEMONS" && echo "$pid"; done; }
+# all pids whose path matches a heavy app or a user-added extra
+app_pids(){ ps -axo pid=,comm= | while read -r pid cmd; do { path_hits "$cmd" "$CAP_APPS" || extra_hits "$cmd"; } && echo "$pid"; done; }
+
+# ---------- actions ----------
+pause_pid(){   priv "$1" kill -STOP "$1" 2>/dev/null; }
+resume_pid(){  priv "$1" kill -CONT "$1" 2>/dev/null; }
+renice_pid(){  priv "$2" renice "$1" -p "$2" >/dev/null 2>&1; }
+limit_pid(){ # pid limit%
+  local pid="$1" lim="$2"
+  if [ "$(owner_uid "$pid")" != "$(id -u)" ]; then sudo cpulimit -p "$pid" -l "$lim" -i >/dev/null 2>&1 &
+  else cpulimit -p "$pid" -l "$lim" -i >/dev/null 2>&1 & fi
+  echo "$!" >> "$CPULIMIT_PIDS"
+}
+drop_all_limits(){ pkill -x cpulimit 2>/dev/null; sudo pkill -x cpulimit 2>/dev/null; : > "$CPULIMIT_PIDS"; }
+
+warm_sudo_if_needed(){ # pre-prompt once if any listed pid is root-owned
+  local pid
+  for pid in $(daemon_pids); do
+    [ "$(owner_uid "$pid")" != "$(id -u)" ] && { echo "Some targets are system daemons — caching sudo..."; sudo -v || true; return; }
+  done
+}
+
+label(){ local pid="$1" b; b="$(base_of "$pid")"; case "$b" in "")echo "$pid";; *)echo "$b ($pid)";; esac; }
+
+# ---------- modes ----------
+mode_on(){
+  CALL_PIDS="$(call_pids)"; warm_sudo_if_needed
+  local pid n=0
+  for pid in $(daemon_pids); do
+    is_protected "$pid" && continue
+    renice_pid "$RENICE_VAL" "$pid"; limit_pid "$pid" "$SOFT_LIMIT"
+    echo "  capped  $(label "$pid")  -> ${SOFT_LIMIT}% / nice ${RENICE_VAL}"; n=$((n+1))
+  done
+  echo "quiet mode ON — $n background daemon(s) throttled. Apps left alone. (cap off to release)"
+}
+
+mode_call(){
+  CALL_PIDS="$(call_pids)"; warm_sudo_if_needed
+  [ -n "$CALL_PIDS" ] && echo "active call detected: PID(s) $CALL_PIDS (whitelisted)" || echo "no active call detected (no live mic) — capping anyway"
+  local pid n=0 m=0
+  for pid in $(daemon_pids); do
+    is_protected "$pid" && continue
+    pause_pid "$pid" && { echo "  paused  $(label "$pid")"; n=$((n+1)); }
+  done
+  for pid in $(app_pids); do
+    is_protected "$pid" && continue
+    renice_pid "$RENICE_VAL" "$pid"; limit_pid "$pid" "$APP_LIMIT"
+    echo "  capped  $(label "$pid")  -> ${APP_LIMIT}%"; m=$((m+1))
+  done
+  echo "call mode ON — $n daemon(s) paused, $m app proc(s) capped. (cap off to release)"
+}
+
+mode_off(){
+  CALL_PIDS=""
+  local pid n=0
+  drop_all_limits
+  for pid in $(daemon_pids) $(app_pids); do
+    resume_pid "$pid"          # SIGCONT is a no-op if not stopped
+    renice_pid 0 "$pid"; n=$((n+1))
+  done
+  echo "released — resumed/restored $n process(es), all cpu caps dropped."
+}
+
+mode_status(){
+  CALL_PIDS="$(call_pids)"
+  echo "== paused / capped / busy managed processes =="
+  local pid st nice cpu tag shown=0 total=0
+  for pid in $(daemon_pids) $(app_pids); do
+    st="$(state_of "$pid")"; [ -z "$st" ] && continue
+    total=$((total+1))
+    nice="$(ps -o nice= -p "$pid" 2>/dev/null | tr -d ' ')"
+    cpu="$(ps -o pcpu= -p "$pid" 2>/dev/null | tr -d ' ')"
+    case "$st" in
+      *T*) tag="PAUSED " ;;
+      *) if awk "BEGIN{exit !(${cpu:-0}>=2)}"; then tag="busy   "
+         elif [ "${nice:-0}" -gt 0 ] 2>/dev/null; then tag="niced  "
+         else continue; fi ;;
+    esac
+    printf "  [%s] %-44s cpu=%s%% nice=%s\n" "$tag" "$(label "$pid")" "$cpu" "$nice"
+    shown=$((shown+1))
+  done
+  echo "  ($shown shown of $total managed-eligible; rest idle/unchanged)"
+  echo "active call PID(s): ${CALL_PIDS:-none}"
+  echo "cpulimit daemons running: $(pgrep -x cpulimit | wc -l | tr -d ' ')"
+}
+
+suggest_once(){
+  CALL_PIDS="$(call_pids)"
+  echo "== hogs over thresholds (cpu>=${CPU_THRESHOLD}% or mem>=${MEM_THRESHOLD}%) =="
+  ps -axo pid=,pcpu=,pmem=,comm= -r | while read -r pid cpu mem cmd; do
+    awk "BEGIN{exit !($cpu>=$CPU_THRESHOLD || $mem>=$MEM_THRESHOLD)}" || continue
+    is_protected "$pid" && { printf "  protected  %-34s cpu=%s%% mem=%s%%\n" "${cmd##*/}" "$cpu" "$mem"; continue; }
+    if in_words "${cmd##*/}" "$CAP_DAEMONS" || path_hits "$cmd" "$CAP_APPS" || extra_hits "$cmd"; then
+      printf "  managed    %-34s cpu=%s%% mem=%s%%\n" "${cmd##*/}" "$cpu" "$mem"
+    else
+      printf "  SUGGEST    %-34s cpu=%s%% mem=%s%%   -> cap add \"%s\"\n" "${cmd##*/}" "$cpu" "$mem" "${cmd##*/}"
+    fi
+  done
+  echo "== network talkers over ${NET_THRESHOLD_KB}KB/sample =="
+  nettop -P -n -x -d -l 2 -J bytes_in,bytes_out 2>/dev/null | tail -n +2 | awk -v t=$((NET_THRESHOLD_KB*1024)) \
+    'NF>=3{a[$1]=$(NF-1)+$NF} END{for(k in a) if(a[k]>t) printf "  %-44s %d KB\n",k,a[k]/1024}' | sort -k2 -nr | head -8
+}
+
+case "${1:-help}" in
+  on)       mode_on ;;
+  call)     mode_call ;;
+  off)      mode_off ;;
+  status)   mode_status ;;
+  suggest)  suggest_once ;;
+  monitor)  while true; do clear; date "+%H:%M:%S"; suggest_once; sleep "${2:-5}"; done ;;
+  add)      shift; [ -z "${1:-}" ] && { echo "usage: cap add <path-or-name-substring>"; exit 1; }
+            echo "$*" >> "$EXTRA_LIST"; echo "added to cap list: $*  ($EXTRA_LIST)" ;;
+  list)     echo "PROTECTED names:"; echo "  $PROTECTED_NAMES"; echo "PROTECTED paths:"; echo "  $PROTECTED_PATHS";
+            echo "CAP daemons:"; echo "  $CAP_DAEMONS"; echo "CAP apps:"; echo "  $CAP_APPS";
+            echo "EXTRA (user):"; sed 's/^/  /' "$EXTRA_LIST" ;;
+  help|-h|--help) sed -n '2,20p' "$0" | sed 's/^#//;s/^ //' ;;
+  *)        echo "unknown mode: $1"; echo "try: cap help"; exit 1 ;;
+esac
