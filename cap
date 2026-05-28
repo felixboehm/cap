@@ -2,16 +2,16 @@
 #
 # cap — call-aware process throttler for macOS
 #
-#   cap on            soft-cap background indexers/daemons (renice + cpulimit)
-#   cap call          hard-pause daemons + soft-cap heavy apps; never the live call
-#   cap off           release everything (resume, restore priority, drop caps)
-#   cap status        show what is currently paused / capped
+#   cap call          quiet things for a call: pause background daemons,
+#                       cpu-cap heavy apps, block sync clients' network
+#   cap off           release everything (resume, unblock, drop caps)
+#   cap status        show what is paused / capped / blocked
 #   cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
-#   cap add <pat>     remember a process/app (path substring) to cap from now on
-#   cap list          show what each mode caps vs. protects
+#   cap add <pat>     remember a process/app (substring) to cap from now on
+#   cap list          show what call mode caps vs. protects
 #
-# Capping your own apps needs no sudo. Capping system daemons (mds_stores, etc.)
-# needs root, so for the full effect run:  sudo cap call  /  sudo cap on
+# No sudo needed to cap your own apps. Pausing system daemons + blocking
+# sync clients needs root:  sudo cap call  /  sudo cap off
 #
 set -uo pipefail
 shopt -s nocasematch 2>/dev/null   # case-insensitive [[ ]] / case — avoids forking `tr` per compare
@@ -25,12 +25,14 @@ mkdir -p "$STATE_DIR"
 [ -f "$EXTRA_LIST" ] || : > "$EXTRA_LIST"
 
 # ---------- tunables (override in ~/.cap/config.sh) ----------
-CPU_THRESHOLD=20      # %CPU to flag in suggest/monitor
-MEM_THRESHOLD=5       # %MEM to flag in suggest/monitor
+CPU_THRESHOLD=20      # %CPU to flag in suggest
+MEM_THRESHOLD=5       # %MEM to flag in suggest
 NET_THRESHOLD_KB=300  # KB over the sample window to flag a network talker
-SOFT_LIMIT=15         # cpulimit % per core for `on`
-APP_LIMIT=25          # cpulimit % per core for apps in `call`
+APP_LIMIT=25          # cpulimit % per core for heavy apps in `call`
 RENICE_VAL=18         # nice value applied when soft-capping
+THROTTLE_GROUP=capnet # group used to tag sync-client traffic for the pf block
+PF_ANCHOR=cap
+PF_ANCHOR_FILE=/etc/pf.anchors/cap
 
 # Exact basename match — never touched.
 PROTECTED_NAMES="kernel_task launchd WindowServer coreaudiod loginwindow logind \
@@ -40,25 +42,27 @@ securityd trustd sshd sudo cap cpulimit"
 # Path substring match — also never touched (the session itself).
 PROTECTED_PATHS=".local/bin/claude Terminal.app iTerm.app"
 
-# Exact basename match — background daemons + sync clients safe to throttle/pause.
-# (sync engines only — their FinderSyncExt helpers are left alone so Finder
-#  doesn't stall on a frozen extension.)
+# Exact basename match — background daemons hard-paused (SIGSTOP) in `call`.
 CAP_DAEMONS="mds_stores mdworker mdworker_shared mdbulkimport spotlightknowledged \
 knowledgeconstructiond corespotlightd managedcorespotlightd backupd backupd-helper \
-photoanalysisd photolibraryd mediaanalysisd cloudd bird AssetCacheLocatorService \
-owncloud OpenCloud"
+photoanalysisd photolibraryd mediaanalysisd cloudd bird AssetCacheLocatorService"
 
 # Path substring match — heavy *background* apps to soft-cap in `call` mode.
 # Interactive tools you use during a call (Teams = the call itself, Chrome,
 # VS Code) are intentionally excluded so the call/your work isn't throttled.
 CAP_APPS="Spotify|Docker|qemu|java"
 
+# Sync clients — network-BLOCKED in `call` mode. They are relaunched under the
+# throttle group (so pf can match their traffic), but ONLY if already running;
+# cap never starts them itself.
+SYNC_APPS="owncloud OpenCloud"
+
 [ -f "$USER_CONF" ] && . "$USER_CONF"
 
 # ---------- helpers ----------
 have(){ command -v "$1" >/dev/null 2>&1; }
-# Warn (on every run) about missing external deps. Network control uses
-# built-in pf/dnctl, so cpulimit is the only thing that can be absent.
+# Warn (every run) about missing external deps. Network control uses built-in
+# pf, so cpulimit is the only thing that can be absent.
 dep_warn(){ have cpulimit || echo "cap: WARNING — cpulimit not installed; CPU caps disabled (renice/pause still work). Install: brew install cpulimit" >&2; }
 path_of(){ ps -o comm= -p "$1" 2>/dev/null; }
 base_of(){ local p; p="$(path_of "$1")"; [ -n "$p" ] && printf '%s' "${p##*/}"; }
@@ -110,7 +114,7 @@ daemon_pids(){ ps -axo pid=,comm= | while read -r pid cmd; do in_words "${cmd##*
 # all pids whose path matches a heavy app or a user-added extra
 app_pids(){ ps -axo pid=,comm= | while read -r pid cmd; do { path_hits "$cmd" "$CAP_APPS" || extra_hits "$cmd"; } && echo "$pid"; done; }
 
-# ---------- actions ----------
+# ---------- actions: cpu / pause ----------
 pause_pid(){   priv "$1" kill -STOP "$1" 2>/dev/null; }
 resume_pid(){  priv "$1" kill -CONT "$1" 2>/dev/null; }
 renice_pid(){  priv "$2" renice "$1" -p "$2" >/dev/null 2>&1; }
@@ -122,31 +126,42 @@ limit_pid(){ # pid limit%
 }
 drop_all_limits(){ pkill -x cpulimit 2>/dev/null; sudo pkill -x cpulimit 2>/dev/null; : > "$CPULIMIT_PIDS"; }
 
-warm_sudo_if_needed(){ # pre-prompt once if any listed pid is root-owned
-  local pid
-  for pid in $(daemon_pids); do
-    [ "$(owner_uid "$pid")" != "$(id -u)" ] && { echo "Some targets are system daemons — caching sudo..."; sudo -v || true; return; }
-  done
-}
-
+warm_sudo_if_needed(){ echo "caching sudo (needed for daemons + network block)..."; sudo -v || true; }
 label(){ local pid="$1" b; b="$(base_of "$pid")"; case "$b" in "")echo "$pid";; *)echo "$b ($pid)";; esac; }
 
-# ---------- modes ----------
-mode_on(){
-  detect_call; warm_sudo_if_needed
-  local pid n=0
-  for pid in $(daemon_pids); do
-    is_protected "$pid" && continue
-    renice_pid "$RENICE_VAL" "$pid"; limit_pid "$pid" "$SOFT_LIMIT"
-    echo "  capped  $(label "$pid")  -> ${SOFT_LIMIT}% / nice ${RENICE_VAL}"; n=$((n+1))
-  done
-  echo "quiet mode ON — $n background daemon(s) throttled. Apps left alone. (cap off to release)"
+# ---------- actions: network block (pf, by group) ----------
+group_gid(){ dscl . -read "/Groups/$THROTTLE_GROUP" PrimaryGroupID 2>/dev/null | awk '{print $2}'; }
+ensure_group(){ [ -n "$(group_gid)" ] || sudo dseditgroup -o create "$THROTTLE_GROUP" >/dev/null 2>&1; }
+# is app $1 currently running under the throttle group?
+under_group(){ local gid pid; gid="$(group_gid)"; [ -n "$gid" ] || return 1
+  for pid in $(pgrep -x "$1" 2>/dev/null); do [ "$(ps -o gid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$gid" ] && return 0; done
+  return 1; }
+# relaunch app $1 under the throttle group — ONLY if it is already running.
+regroup_app(){ local app="$1" n=0
+  pgrep -x "$app" >/dev/null 2>&1 || { echo "  $app not running — skipped"; return 0; }
+  under_group "$app" && { echo "  $app already under '$THROTTLE_GROUP'"; return 0; }
+  echo "  restarting $app under '$THROTTLE_GROUP'..."
+  osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1
+  while pgrep -x "$app" >/dev/null 2>&1 && [ "$n" -lt 12 ]; do sleep 0.5; n=$((n+1)); done
+  pgrep -x "$app" >/dev/null 2>&1 && pkill -x "$app" 2>/dev/null
+  sudo -g "$THROTTLE_GROUP" open -a "$app" && echo "    relaunched $app"
 }
+pf_block_on(){
+  ensure_group
+  printf 'block drop out group %s\n' "$THROTTLE_GROUP" | sudo tee "$PF_ANCHOR_FILE" >/dev/null
+  grep -q "anchor \"$PF_ANCHOR\"" /etc/pf.conf 2>/dev/null || \
+    printf 'anchor "%s"\nload anchor "%s" from "%s"\n' "$PF_ANCHOR" "$PF_ANCHOR" "$PF_ANCHOR_FILE" | sudo tee -a /etc/pf.conf >/dev/null
+  sudo pfctl -f /etc/pf.conf >/dev/null 2>&1
+  sudo pfctl -e >/dev/null 2>&1 || true   # ignore "already enabled"
+  echo "  network: blocking group '$THROTTLE_GROUP' outbound"
+}
+pf_block_off(){ sudo pfctl -a "$PF_ANCHOR" -F rules >/dev/null 2>&1 && echo "  network: unblocked"; }
 
+# ---------- modes ----------
 mode_call(){
   detect_call; warm_sudo_if_needed
-  [ -n "$CALL_PIDS" ] && echo "active call detected: PID(s) $CALL_PIDS (whitelisted)" || echo "no active call detected (no live mic) — capping anyway"
-  local pid n=0 m=0
+  [ -n "$CALL_PIDS" ] && echo "active call: PID(s) $CALL_PIDS (whitelisted)" || echo "no active call (no live mic) — capping anyway"
+  local pid app n=0 m=0
   for pid in $(daemon_pids); do
     is_protected "$pid" && continue
     pause_pid "$pid" && { echo "  paused  $(label "$pid")"; n=$((n+1)); }
@@ -154,27 +169,30 @@ mode_call(){
   for pid in $(app_pids); do
     is_protected "$pid" && continue
     renice_pid "$RENICE_VAL" "$pid"; limit_pid "$pid" "$APP_LIMIT"
-    echo "  capped  $(label "$pid")  -> ${APP_LIMIT}%"; m=$((m+1))
+    echo "  capped  $(label "$pid") -> ${APP_LIMIT}%"; m=$((m+1))
   done
-  echo "call mode ON — $n daemon(s) paused, $m app proc(s) capped. (cap off to release)"
+  for app in $SYNC_APPS; do regroup_app "$app"; done
+  pf_block_on
+  echo "call mode ON — $n daemon(s) paused, $m app(s) capped, sync clients blocked. (cap off to release)"
 }
 
 mode_off(){
   CALL_PIDS=""; CALL_BUNDLES=""
   local pid n=0
+  pf_block_off
   drop_all_limits
   for pid in $(daemon_pids) $(app_pids); do
     resume_pid "$pid"          # SIGCONT is a no-op if not stopped
     renice_pid 0 "$pid"; n=$((n+1))
   done
-  echo "released — resumed/restored $n process(es), all cpu caps dropped."
+  echo "released — resumed/restored $n process(es), caps dropped, network unblocked."
+  echo "(sync clients keep running under '$THROTTLE_GROUP'; harmless once unblocked)"
 }
 
 mode_status(){
   detect_call
   echo "== paused / capped / busy managed processes =="
-  local pid st nice cpu cmd base tag shown=0 total=0
-  # one ps snapshot fed via here-doc (keeps the loop in this shell so counters persist)
+  local pid st nice cpu cmd base tag app under shown=0 total=0
   while read -r pid st nice cpu cmd; do
     [ -z "${pid:-}" ] && continue
     base="${cmd##*/}"
@@ -194,6 +212,8 @@ EOF
   echo "  ($shown shown of $total managed-eligible; rest idle/unchanged)"
   echo "active call PID(s): ${CALL_PIDS:-none}"
   echo "cpulimit daemons running: $(pgrep -x cpulimit | wc -l | tr -d ' ')"
+  local under=""; for app in $SYNC_APPS; do under_group "$app" && under="$under $app"; done
+  echo "sync clients under '$THROTTLE_GROUP' (blockable):${under:- none}"
 }
 
 suggest_once(){
@@ -215,7 +235,6 @@ suggest_once(){
 
 dep_warn
 case "${1:-help}" in
-  on)       mode_on ;;
   call)     mode_call ;;
   off)      mode_off ;;
   status)   mode_status ;;
@@ -223,18 +242,16 @@ case "${1:-help}" in
             else suggest_once; fi ;;
   add)      shift; [ -z "${1:-}" ] && { echo "usage: cap add <path-or-name-substring>"; exit 1; }
             echo "$*" >> "$EXTRA_LIST"; echo "added to cap list: $*  ($EXTRA_LIST)" ;;
-  list)     echo "PROTECTED — never touched in any mode:"
+  list)     echo "PROTECTED — never touched:"
             echo "  names: $PROTECTED_NAMES"
             echo "  paths: $PROTECTED_PATHS"
-            echo "  + the live call PID (auto-detected via mic assertion)"
+            echo "  + the live call app's whole bundle (auto-detected via mic assertion)"
             echo
-            echo "mode 'on'   — soft-cap (renice $RENICE_VAL + cpulimit ${SOFT_LIMIT}%); apps untouched:"
-            echo "  daemons: $CAP_DAEMONS"
-            echo
-            echo "mode 'call' — PAUSE daemons, then soft-cap apps+extra (cpulimit ${APP_LIMIT}%):"
-            echo "  daemons (paused): $CAP_DAEMONS"
-            echo "  apps (capped):    ${CAP_APPS//|/, }"
-            echo "  extra (capped):   $(tr '\n' ' ' < "$EXTRA_LIST")" ;;
+            echo "mode 'call' — quiet things for a call:"
+            echo "  daemons (paused):        $CAP_DAEMONS"
+            echo "  heavy apps (cpu-capped): ${CAP_APPS//|/, }"
+            echo "  extra (cpu-capped):      $(tr '\n' ' ' < "$EXTRA_LIST")"
+            echo "  sync clients (blocked):  $SYNC_APPS   (relaunched under group '$THROTTLE_GROUP' if running)" ;;
   help|-h|--help) sed -n '3,14p' "$0" | sed 's/^#//;s/^ //' ;;
   *)        echo "unknown mode: $1"; echo "try: cap help"; exit 1 ;;
 esac
