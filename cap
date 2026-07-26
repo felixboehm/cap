@@ -9,6 +9,8 @@
 #   cap suggest [sec] list current CPU/RAM/net hogs; with [sec], loop every sec
 #   cap add <pat>     remember a process/app (substring) to cap from now on
 #   cap list          show what call mode does vs. protects
+#   cap vm [on|off|status]  start/stop the Rancher Desktop VM, or show if it
+#                       runs and what RAM/CPU it uses (default: status)
 #   cap setup         one-time: install a sudoers drop-in so call/off need no password
 #
 # Quitting your own apps needs no sudo. Pausing system daemons needs root —
@@ -23,6 +25,7 @@ EXTRA_LIST="$CAP_HOME/extra.list"
 USER_CONF="$CAP_HOME/config.sh"
 CPULIMIT_PIDS="$STATE_DIR/cpulimit.pids"
 RELAUNCH_LIST="$STATE_DIR/sync_relaunch"   # sync apps cap quit, to relaunch on `off`
+RDCTL="${RDCTL:-$HOME/.rd/bin/rdctl}"      # Rancher Desktop CLI, for `cap vm`
 mkdir -p "$STATE_DIR"
 [ -f "$EXTRA_LIST" ] || : > "$EXTRA_LIST"
 
@@ -142,6 +145,64 @@ relaunch_sync(){
   : > "$RELAUNCH_LIST"
 }
 
+# ---------- Rancher Desktop VM ----------
+# The lima/qemu VM keeps running (and holding RAM) after the GUI is closed;
+# these give a quick manual on/off plus a resource readout. Independent of
+# call/off, which only CPU-cap qemu.
+vm_qemu_pid(){ pgrep -f 'lima/bin/qemu-system' | head -1; }
+vm_up(){ pgrep -f 'lima/bin/qemu-system|limactl hostagent' >/dev/null 2>&1; }
+
+vm_status(){
+  local pid rss pcpu resmb
+  pid="$(vm_qemu_pid)"
+  if [ -z "$pid" ]; then
+    echo "Rancher VM: stopped"
+    return 0
+  fi
+  # RSS in KB, %CPU, and the -m reservation from qemu's own args (MiB).
+  read -r rss pcpu <<EOF
+$(ps -o rss=,pcpu= -p "$pid")
+EOF
+  resmb="$(ps -o command= -p "$pid" | grep -oE '\-m [0-9]+' | head -1 | awk '{print $2}')"
+  echo "Rancher VM: running (qemu pid $pid)"
+  # awk does the arithmetic and formatting in a locale-independent way.
+  awk -v r="${rss:-0}" -v m="${resmb:-0}" -v c="${pcpu:-0}" 'BEGIN{
+    printf "  RAM in use:   %.2f GB (RSS)\n", r/1048576
+    if (m+0 > 0) printf "  RAM reserved: %.2f GB (qemu -m)\n", m/1024
+    printf "  CPU:          %s%%\n", c
+  }'
+}
+
+vm_on(){
+  [ -x "$RDCTL" ] || { echo "cap: rdctl not found at $RDCTL"; return 1; }
+  vm_up && { echo "Rancher VM already running."; vm_status; return 0; }
+  echo "starting Rancher VM..."
+  as_user "$RDCTL" start && vm_status
+}
+
+vm_off(){
+  [ -x "$RDCTL" ] || { echo "cap: rdctl not found at $RDCTL"; return 1; }
+  vm_up || { echo "Rancher VM already stopped."; return 0; }
+  echo "stopping Rancher VM..."
+  as_user "$RDCTL" shutdown
+  # hard fallback if the graceful path stalls
+  local n=0; while vm_up && [ "$n" -lt 15 ]; do sleep 2; n=$((n+1)); done
+  if vm_up; then
+    echo "  graceful shutdown stalled — killing hostagent/qemu"
+    as_user pkill -f 'limactl hostagent'; as_user pkill -f 'lima/bin/qemu-system'
+  fi
+  echo "Rancher VM stopped."
+}
+
+mode_vm(){
+  case "${1:-status}" in
+    on|start|up)     vm_on ;;
+    off|stop|down)   vm_off ;;
+    status|"")       vm_status ;;
+    *) echo "usage: cap vm [on|off|status]"; return 1 ;;
+  esac
+}
+
 # ---------- modes ----------
 mode_call(){
   detect_call
@@ -238,6 +299,7 @@ case "${1:-help}" in
   off)      mode_off ;;
   setup)    mode_setup ;;
   status)   mode_status ;;
+  vm)       shift; mode_vm "${1:-}" ;;
   suggest)  if [ -n "${2:-}" ]; then while true; do clear 2>/dev/null; date "+%H:%M:%S"; suggest_once; sleep "$2"; done
             else suggest_once; fi ;;
   add)      shift; [ -z "${1:-}" ] && { echo "usage: cap add <path-or-name-substring>"; exit 1; }
@@ -251,7 +313,11 @@ case "${1:-help}" in
             echo "  daemons (paused):        $CAP_DAEMONS"
             echo "  heavy apps (cpu-capped): ${CAP_APPS//|/, }"
             echo "  extra (cpu-capped):      $(tr '\n' ' ' < "$EXTRA_LIST")"
-            echo "  sync clients (quit):     $SYNC_APPS   (relaunched on 'cap off')" ;;
+            echo "  sync clients (quit):     $SYNC_APPS   (relaunched on 'cap off')"
+            echo
+            echo "Rancher VM (separate from call/off — use 'cap vm'):"
+            echo "  cap vm status  — running? RAM/CPU in use"
+            echo "  cap vm on|off  — start / stop the lima+qemu VM via rdctl" ;;
   help|-h|--help) sed -n '3,15p' "$0" | sed 's/^#//;s/^ //' ;;
   *)        echo "unknown mode: $1"; echo "try: cap help"; exit 1 ;;
 esac
